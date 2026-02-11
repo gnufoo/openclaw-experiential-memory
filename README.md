@@ -2,6 +2,22 @@
 
 An arousal-based memory system that automatically scores, logs, and consolidates agent experiences.
 
+## OpenClaw Core Patch Required
+
+This system requires the `message:received` hook in OpenClaw. If your version doesn't have it:
+
+```bash
+# In your openclaw directory
+git apply openclaw-hook.patch
+npm run build
+```
+
+The patch adds `message:received` hook that fires on every incoming message with context:
+- `body`, `rawBody` — Message content
+- `senderId`, `channel`, `chatType` — Sender info
+- `messageId`, `replyToId` — Message IDs
+- `wasMentioned`, `workspaceDir` — Additional context
+
 ## What It Does
 
 - **Automatic scoring** — Every incoming message is scored for arousal/importance (1-10)
