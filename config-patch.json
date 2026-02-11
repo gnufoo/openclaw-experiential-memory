@@ -1,0 +1,13 @@
+{
+  "$comment": "Merge this into your ~/.openclaw/openclaw.json",
+  "hooks": {
+    "internal": {
+      "enabled": true,
+      "entries": {
+        "memory-system": {
+          "enabled": true
+        }
+      }
+    }
+  }
+}
