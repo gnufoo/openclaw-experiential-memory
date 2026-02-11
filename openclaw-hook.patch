@@ -1,0 +1,283 @@
+From fdab9de0f07338340b3274acd84f988720584d30 Mon Sep 17 00:00:00 2001
+From: "Zero (Vector Labs)" <zero@vectorlabs.ai>
+Date: Sun, 8 Feb 2026 01:49:44 +0000
+Subject: [PATCH] feat(hooks): implement message:received hook
+
+Add message:received hook event that triggers when a message is received
+before agent processing. This enables custom hooks to:
+- Log/analyze incoming messages in real-time
+- Build experiential memory systems
+- Implement custom message filtering or tagging
+- Track conversation patterns
+
+The hook fires asynchronously (fire-and-forget) to avoid blocking
+message processing.
+
+Context includes:
+- body: Message text
+- rawBody: Raw message without structural context
+- senderId: Sender identifier
+- channel: Originating channel (telegram, whatsapp, etc.)
+- chatType: direct/group
+- messageId: Provider message ID
+- replyToId: Reply-to ID if applicable
+- wasMentioned: Whether bot was mentioned
+- workspaceDir: Agent workspace directory
+
+Commands (messages starting with /) do not trigger this hook as they
+have their own command:* hooks.
+
+Co-authored-by: Tony Xia <xia.tony@gmail.com>
+---
+ docs/automation/hooks.md              |  10 ++-
+ src/auto-reply/dispatch-hooks.test.ts | 111 ++++++++++++++++++++++++++
+ src/auto-reply/dispatch.ts            |  21 +++++
+ src/hooks/internal-hooks.ts           |  40 +++++++++-
+ 4 files changed, 180 insertions(+), 2 deletions(-)
+ create mode 100644 src/auto-reply/dispatch-hooks.test.ts
+
+diff --git a/docs/automation/hooks.md b/docs/automation/hooks.md
+index e842b8c58..a28641fe3 100644
+--- a/docs/automation/hooks.md
++++ b/docs/automation/hooks.md
+@@ -240,6 +240,15 @@ Triggered when the gateway starts:
+ 
+ - **`gateway:startup`**: After channels start and hooks are loaded
+ 
++### Message Events
++
++Triggered when messages are sent or received:
++
++- **`message:received`**: When a message is received (before agent processing)
++  - Fires for all non-command messages
++  - Context includes: `body`, `rawBody`, `senderId`, `channel`, `chatType`, `messageId`, `replyToId`, `wasMentioned`, `workspaceDir`
++  - Runs asynchronously (doesn't block message processing)
++
+ ### Tool Result Hooks (Plugin API)
+ 
+ These hooks are not event-stream listeners; they let plugins synchronously adjust tool results before OpenClaw persists them.
+@@ -254,7 +263,6 @@ Planned event types:
+ - **`session:end`**: When a session ends
+ - **`agent:error`**: When an agent encounters an error
+ - **`message:sent`**: When a message is sent
+-- **`message:received`**: When a message is received
+ 
+ ## Creating Custom Hooks
+ 
+diff --git a/src/auto-reply/dispatch-hooks.test.ts b/src/auto-reply/dispatch-hooks.test.ts
+new file mode 100644
+index 000000000..51f6a2cd5
+--- /dev/null
++++ b/src/auto-reply/dispatch-hooks.test.ts
+@@ -0,0 +1,111 @@
++import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
++import { dispatchInboundMessage } from "./dispatch.js";
++import * as internalHooks from "../hooks/internal-hooks.js";
++import type { MsgContext } from "./templating.js";
++import type { OpenClawConfig } from "../config/config.js";
++
++describe("dispatchInboundMessage hooks", () => {
++  let triggerSpy: ReturnType<typeof vi.spyOn>;
++
++  beforeEach(() => {
++    triggerSpy = vi.spyOn(internalHooks, "triggerInternalHook").mockResolvedValue();
++  });
++
++  afterEach(() => {
++    vi.restoreAllMocks();
++  });
++
++  it("triggers message:received hook for regular messages", async () => {
++    const ctx: MsgContext = {
++      Body: "Hello, this is a test message",
++      From: "user123",
++      SessionKey: "test-session",
++      Channel: "telegram",
++      ChatType: "direct",
++      MessageSid: "msg-123",
++    };
++
++    const cfg = { workspace: { dir: "/test/workspace" } } as OpenClawConfig;
++    const dispatcher = {
++      dispatch: vi.fn(),
++      waitForIdle: vi.fn().mockResolvedValue(undefined),
++    };
++
++    // We're testing the hook trigger, not the full dispatch
++    // So we mock dispatchReplyFromConfig
++    vi.mock("./reply/dispatch-from-config.js", () => ({
++      dispatchReplyFromConfig: vi.fn().mockResolvedValue({ kind: "ok" }),
++    }));
++
++    await dispatchInboundMessage({
++      ctx,
++      cfg,
++      dispatcher: dispatcher as any,
++    });
++
++    expect(triggerSpy).toHaveBeenCalledWith(
++      expect.objectContaining({
++        type: "message",
++        action: "received",
++        sessionKey: "test-session",
++        context: expect.objectContaining({
++          body: "Hello, this is a test message",
++          senderId: "user123",
++          channel: "telegram",
++        }),
++      }),
++    );
++  });
++
++  it("does not trigger message:received hook for commands", async () => {
++    const ctx: MsgContext = {
++      Body: "/new",
++      From: "user123",
++      SessionKey: "test-session",
++    };
++
++    const cfg = {} as OpenClawConfig;
++    const dispatcher = {
++      dispatch: vi.fn(),
++      waitForIdle: vi.fn().mockResolvedValue(undefined),
++    };
++
++    vi.mock("./reply/dispatch-from-config.js", () => ({
++      dispatchReplyFromConfig: vi.fn().mockResolvedValue({ kind: "ok" }),
++    }));
++
++    await dispatchInboundMessage({
++      ctx,
++      cfg,
++      dispatcher: dispatcher as any,
++    });
++
++    expect(triggerSpy).not.toHaveBeenCalled();
++  });
++
++  it("does not trigger for empty messages", async () => {
++    const ctx: MsgContext = {
++      Body: "",
++      From: "user123",
++      SessionKey: "test-session",
++    };
++
++    const cfg = {} as OpenClawConfig;
++    const dispatcher = {
++      dispatch: vi.fn(),
++      waitForIdle: vi.fn().mockResolvedValue(undefined),
++    };
++
++    vi.mock("./reply/dispatch-from-config.js", () => ({
++      dispatchReplyFromConfig: vi.fn().mockResolvedValue({ kind: "ok" }),
++    }));
++
++    await dispatchInboundMessage({
++      ctx,
++      cfg,
++      dispatcher: dispatcher as any,
++    });
++
++    expect(triggerSpy).not.toHaveBeenCalled();
++  });
++});
+diff --git a/src/auto-reply/dispatch.ts b/src/auto-reply/dispatch.ts
+index d018623c7..21e88eec0 100644
+--- a/src/auto-reply/dispatch.ts
++++ b/src/auto-reply/dispatch.ts
+@@ -2,6 +2,7 @@ import type { OpenClawConfig } from "../config/config.js";
+ import type { DispatchFromConfigResult } from "./reply/dispatch-from-config.js";
+ import type { FinalizedMsgContext, MsgContext } from "./templating.js";
+ import type { GetReplyOptions } from "./types.js";
++import { createInternalHookEvent, triggerInternalHook } from "../hooks/internal-hooks.js";
+ import { dispatchReplyFromConfig } from "./reply/dispatch-from-config.js";
+ import { finalizeInboundContext } from "./reply/inbound-context.js";
+ import {
+@@ -22,6 +23,26 @@ export async function dispatchInboundMessage(params: {
+   replyResolver?: typeof import("./reply.js").getReplyFromConfig;
+ }): Promise<DispatchInboundResult> {
+   const finalized = finalizeInboundContext(params.ctx);
++
++  // Trigger message:received hook before processing
++  const messageBody = finalized.Body ?? finalized.RawBody ?? "";
++  if (messageBody && !messageBody.startsWith("/")) {
++    // Don't trigger for commands (they have their own hooks)
++    const hookEvent = createInternalHookEvent("message", "received", finalized.SessionKey ?? "", {
++      body: messageBody,
++      rawBody: finalized.RawBody,
++      senderId: finalized.From,
++      channel: finalized.Channel,
++      chatType: finalized.ChatType,
++      messageId: finalized.MessageSid,
++      replyToId: finalized.ReplyToId,
++      wasMentioned: finalized.WasMentioned,
++      workspaceDir: params.cfg.workspace?.dir,
++    });
++    // Fire and forget - don't block message processing
++    void triggerInternalHook(hookEvent);
++  }
++
+   return await dispatchReplyFromConfig({
+     ctx: finalized,
+     cfg: params.cfg,
+diff --git a/src/hooks/internal-hooks.ts b/src/hooks/internal-hooks.ts
+index e92b19366..b38f54953 100644
+--- a/src/hooks/internal-hooks.ts
++++ b/src/hooks/internal-hooks.ts
+@@ -8,7 +8,7 @@
+ import type { WorkspaceBootstrapFile } from "../agents/workspace.js";
+ import type { OpenClawConfig } from "../config/config.js";
+ 
+-export type InternalHookEventType = "command" | "session" | "agent" | "gateway";
++export type InternalHookEventType = "command" | "session" | "agent" | "gateway" | "message";
+ 
+ export type AgentBootstrapHookContext = {
+   workspaceDir: string;
+@@ -25,6 +25,44 @@ export type AgentBootstrapHookEvent = InternalHookEvent & {
+   context: AgentBootstrapHookContext;
+ };
+ 
++export type MessageReceivedHookContext = {
++  /** The message body text */
++  body: string;
++  /** Raw message body without structural context */
++  rawBody?: string;
++  /** Sender identifier */
++  senderId?: string;
++  /** Originating channel (telegram, whatsapp, etc.) */
++  channel?: string;
++  /** Chat type (direct, group, etc.) */
++  chatType?: string;
++  /** Message ID from the provider */
++  messageId?: string;
++  /** Reply-to message ID if this is a reply */
++  replyToId?: string;
++  /** Whether the bot was mentioned */
++  wasMentioned?: boolean;
++  /** Workspace directory for the agent */
++  workspaceDir?: string;
++};
++
++export type MessageReceivedHookEvent = InternalHookEvent & {
++  type: "message";
++  action: "received";
++  context: MessageReceivedHookContext;
++};
++
++export function isMessageReceivedEvent(event: InternalHookEvent): event is MessageReceivedHookEvent {
++  if (event.type !== "message" || event.action !== "received") {
++    return false;
++  }
++  const context = event.context as Partial<MessageReceivedHookContext> | null;
++  if (!context || typeof context !== "object") {
++    return false;
++  }
++  return typeof context.body === "string";
++}
++
+ export interface InternalHookEvent {
+   /** The type of event (command, session, agent, gateway, etc.) */
+   type: InternalHookEventType;
+-- 
+2.34.1
+
